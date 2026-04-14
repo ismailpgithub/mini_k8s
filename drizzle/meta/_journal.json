@@ -1,0 +1,27 @@
+{
+  "version": "7",
+  "dialect": "postgresql",
+  "entries": [
+    {
+      "idx": 0,
+      "version": "7",
+      "when": 1775806855082,
+      "tag": "0000_superb_jasper_sitwell",
+      "breakpoints": true
+    },
+    {
+      "idx": 1,
+      "version": "7",
+      "when": 1775811263745,
+      "tag": "0001_brainy_microbe",
+      "breakpoints": true
+    },
+    {
+      "idx": 2,
+      "version": "7",
+      "when": 1776140719029,
+      "tag": "0002_powerful_darkstar",
+      "breakpoints": true
+    }
+  ]
+}

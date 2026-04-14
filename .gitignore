@@ -1,0 +1,17 @@
+# Dependencies
+node_modules/
+.pnpm-debug.log
+*.log
+# Environment Variables (Crucial!)
+.env
+
+# Database/IDE
+migrations/
+.drizzle/
+.vscode/
+.idea/
+
+# Logs
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
