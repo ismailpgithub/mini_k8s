@@ -6,186 +6,196 @@ import Docker from "dockerode";
 
 const docker = new Docker({ socketPath: "//./pipe/docker_engine" });
 
-function pullImage(image) {
-  return new Promise(async (res) => {
-    const stream = await docker.pull(image);
-    docker.modem.followProgress(stream, () => {
-      res();
+// Helper for formatted logging
+const log = (module, message, data = "") => {
+  const timestamp = new Date().toLocaleTimeString();
+  console.log(`[${timestamp}] [${module}] ${message}`, data);
+};
+
+async function ensureImage(imageName) {
+  try {
+    const filters = JSON.stringify({ reference: [imageName] });
+    const images = await docker.listImages({ filters });
+
+    if (images.length > 0) {
+      log("CRI", `Image already exists: ${imageName}`);
+      return;
+    }
+
+    log("CRI", `Pulling missing image: ${imageName}...`);
+    return new Promise((resolve, reject) => {
+      docker.pull(imageName, (err, stream) => {
+        if (err) return reject(err);
+        docker.modem.followProgress(stream, (err, res) =>
+          err ? reject(err) : resolve(res),
+        );
+      });
     });
-  });
+  } catch (err) {
+    throw new Error(`Docker Pull Failed: ${err.message}`);
+  }
 }
 
+// 1. JOB DISPATCHER
 export const jobDispatchWorker = new Worker(
   "job-dispatcher",
   async () => {
-    console.log("[JobDispatcher] : Checking For New Submitted Jobs...");
-    await db.transaction(
-      async (tx) => {
-        const stmt = sql`
-            SELECT 
-                id 
-            FROM ${jobsTable} 
-            WHERE ${jobsTable.state} = ${jobStatusEnumValues[0]} 
-            ORDER BY ${jobsTable.createdAt} ASC
-            FOR UPDATE SKIP LOCKED 
-            LIMIT 5;
-        `;
+    try {
+      await db.transaction(async (tx) => {
+        const result = await tx.execute(sql`
+        SELECT id FROM ${jobsTable} 
+        WHERE ${jobsTable.state} = ${jobStatusEnumValues[0]} 
+        ORDER BY ${jobsTable.createdAt} ASC 
+        FOR UPDATE SKIP LOCKED LIMIT 5
+      `);
 
-        const result = await tx.execute(stmt);
-        const jobIds = result.rows.map((e) => e.id);
+        const ids = result.rows.map((r) => r.id);
+        if (ids.length === 0) return;
 
-        console.log(
-          `[JobDispatcher] : Found ${jobIds.length} jobs in submitted state`,
-          jobIds,
+        log(
+          "DISPATCHER",
+          `Found ${ids.length} NEW jobs. Moving to RUNNABLE...`,
+          ids,
         );
 
-        //TODO: Check if compute is available
-        if (jobIds.length > 0) {
-          console.log(
-            `[jobDispatcher]: Moving ${jobIds.length} jobs to Runnable State`,
-          );
-
-          await tx
-            .update(jobsTable)
-            .set({ state: "RUNNABLE" })
-            .where(inArray(jobsTable.id, jobIds));
-        }
-      },
-      { accessMode: "read write", isolationLevel: "read committed" },
-    );
+        await tx
+          .update(jobsTable)
+          .set({ state: "RUNNABLE" })
+          .where(inArray(jobsTable.id, ids));
+      });
+    } catch (err) {
+      log("DISPATCHER-ERROR", err.message);
+    }
   },
-  {
-    connection: {
-      host: "127.0.0.1",
-      port: 6379,
-    },
-  },
+  { connection: { host: "127.0.0.1", port: 6379 } },
 );
 
+// 2. CRI WORKER
 export const jobCriWorker = new Worker(
   "job-cri",
   async () => {
-    console.log("[JobDispatcher] : Checking For Runnable Jobs...");
-    await db.transaction(
-      async (tx) => {
-        const stmt = sql`
-            SELECT 
-                id 
-            FROM ${jobsTable} 
-            WHERE ${jobsTable.state} = ${jobStatusEnumValues[1]} 
-            ORDER BY ${jobsTable.createdAt} ASC
-            FOR UPDATE SKIP LOCKED 
-            LIMIT 1;
-        `;
+    const job = await db.transaction(async (tx) => {
+      const result = await tx.execute(sql`
+      SELECT * FROM ${jobsTable} 
+      WHERE ${jobsTable.state} = 'RUNNABLE' 
+      ORDER BY ${jobsTable.createdAt} ASC 
+      FOR UPDATE SKIP LOCKED LIMIT 1
+    `);
 
-        const result = await tx.execute(stmt);
-        const jobIds = result.rows.map((e) => e.id);
+      if (result.rows.length === 0) return null;
+      const jobData = result.rows[0];
 
-        console.log(
-          `[JobDispatcher] : Found ${jobIds.length} jobs in Runnable state`,
-          jobIds,
-        );
+      await tx
+        .update(jobsTable)
+        .set({ state: "RUNNING" })
+        .where(eq(jobsTable.id, jobData.id));
+      return jobData;
+    });
 
-        for (const jobId of jobIds) {
-          const [job] = await db
-            .select()
-            .from(jobsTable)
-            .where(eq(jobsTable.id, jobId));
+    if (!job) return;
 
-          const checkImageResult = await docker.listImages({
-            filters: {
-              reference: [`${job.image}:latest`],
-            },
-          });
+    log("CRI", `Starting Job: ${job.id} | Image: ${job.image}`);
 
-          // const filters = JSON.stringify({
-          //   reference: [`${job.image}:latest`]
-          // });
+    try {
+      const fullImage = job.image.includes(":")
+        ? job.image
+        : `${job.image}:latest`;
 
-          // const checkImageResult = await docker.listImages({ filters });
+      await ensureImage(fullImage);
 
-          if (!checkImageResult || checkImageResult.length <= 0) {
-            console.log(`Pulling Image ${job.image}:latest`);
-            await pullImage(`${job.image}:latest`);
-          }
+      log("CRI", `Creating container for ${job.id}...`);
+      const container = await docker.createContainer({
+        Image: fullImage,
+        Cmd: job.cmd ? job.cmd.split(" ") : [],
+        Labels: { "managed-by": "mini-k8s", "job-id": job.id },
+      });
 
-          const container = docker.createContainer({
-            Image: `${job.image}:latest`,
-            Tty: false,
-            HostConfig: {
-              AutoRemove: false,
-            },
-            Cmd: job.cmd,
-          });
-          container.then(async (c) => {
-            await c.start();
-            console.log(`Container is Up and Running`);
-            await tx
-              .update(jobsTable)
-              .set({ state: "RUNNING", containerId: c.id })
-              .where(eq(jobsTable.id, job.id));
-          });
-        }
-      },
-      { accessMode: "read write", isolationLevel: "read committed" },
-    );
+      await container.start();
+
+      await db
+        .update(jobsTable)
+        .set({ containerId: container.id })
+        .where(eq(jobsTable.id, job.id));
+
+      log("CRI", `Container RUNNING: ${container.id.substring(0, 12)}`);
+    } catch (err) {
+      log("CRI-ERROR", `Job ${job.id} Failed: ${err.message}`);
+      await db
+        .update(jobsTable)
+        .set({ state: "FAILED" })
+        .where(eq(jobsTable.id, job.id));
+    }
   },
-  {
-    connection: {
-      host: "127.0.0.1",
-      port: 6379,
-    },
-  },
+  { connection: { host: "127.0.0.1", port: 6379 } },
 );
 
+// 3. WATCHER WORKER
 export const jobWatchWorker = new Worker(
   "job-watch",
   async () => {
-    await db.transaction(
-      async (tx) => {
-        const stmt = sql`
-            SELECT 
-                id 
-            FROM ${jobsTable} 
-            WHERE ${jobsTable.state} = ${jobStatusEnumValues[2]} 
-            ORDER BY ${jobsTable.createdAt} ASC
-            FOR UPDATE
-            LIMIT 5;
-        `;
+    try {
+      const runningJobs = await db
+        .select()
+        .from(jobsTable)
+        .where(eq(jobsTable.state, "RUNNING"));
 
-        const result = await tx.execute(stmt);
-        const jobIds = result.rows.map((e) => e.id);
+      for (const job of runningJobs) {
+        if (!job.containerId) {
+          log(
+            "WATCHER",
+            `Job ${job.id} is in RUNNING state but has no containerId yet. Skipping...`,
+          );
+          continue;
+        }
 
-        for (const jobId of jobIds) {
-          const [job] = await db
-            .select()
-            .from(jobsTable)
-            .where(eq(jobsTable.id, jobId));
+        try {
+          const container = docker.getContainer(job.containerId);
+          const inspect = await container.inspect();
+          const currentStatus = inspect.State.Status;
 
-          if (job.containerId) {
-            const container = await docker.getContainer(job.containerId);
-            const containerStatus = await container.inspect();
-            console.log(
-              "hey I am inside the if condition",
-              containerStatus.State.Status,
+          if (currentStatus === "exited") {
+            const exitCode = inspect.State.ExitCode;
+            const success = exitCode === 0;
+
+            log(
+              "WATCHER",
+              `Container Exited. Job: ${job.id} | Status: ${success ? "SUCCESS" : "FAILED"} (Code: ${exitCode})`,
             );
-            if (containerStatus.State.Status === "exited") {
-              await tx
-                .update(jobsTable)
-                .set({ state: "SUCCEEDED", containerId: null })
-                .where(eq(jobsTable.id, jobId));
-              await container.remove();
-            }
+
+            await db
+              .update(jobsTable)
+              .set({ state: success ? "SUCCEEDED" : "FAILED" })
+              .where(eq(jobsTable.id, job.id));
+
+            log(
+              "WATCHER",
+              `Cleaning up container ${job.containerId.substring(0, 12)}...`,
+            );
+            await container
+              .remove()
+              .catch((e) => log("WATCHER-CLEANUP-WARN", e.message));
+          }
+        } catch (err) {
+          if (err.statusCode === 404) {
+            log(
+              "WATCHER-WARN",
+              `Container ${job.containerId} not found in Docker. Marking job as FAILED.`,
+            );
+            await db
+              .update(jobsTable)
+              .set({ state: "FAILED" })
+              .where(eq(jobsTable.id, job.id));
+          } else {
+            log(
+              "WATCHER-ERROR",
+              `Failed to inspect job ${job.id}: ${err.message}`,
+            );
           }
         }
-      },
-      { accessMode: "read write", isolationLevel: "read committed" },
-    );
+      }
+    } catch (err) {
+      log("WATCHER-GLOBAL-ERROR", err.message);
+    }
   },
-  {
-    connection: {
-      host: "127.0.0.1",
-      port: 6379,
-    },
-  },
+  { connection: { host: "127.0.0.1", port: 6379 } },
 );
